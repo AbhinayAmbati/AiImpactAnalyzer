@@ -1,0 +1,5 @@
+export { default as Dashboard } from './Dashboard'
+export { default as Analysis } from './Analysis'
+export { default as Coverage } from './Coverage'
+export { default as Repositories } from './Repositories'
+export { default as Settings } from './Settings' 

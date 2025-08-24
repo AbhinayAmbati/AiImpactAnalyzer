@@ -1,0 +1,353 @@
+name: AI Impact Analysis & Test Selection
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - develop
+      - master
+
+env:
+  PYTHON_VERSION: '3.11'
+  API_ENDPOINT: ${{ secrets.IMPACT_ANALYZER_API_ENDPOINT }}
+  API_KEY: ${{ secrets.IMPACT_ANALYZER_API_KEY }}
+
+jobs:
+  impact-analysis:
+    name: Analyze Impact & Select Tests
+    runs-on: ubuntu-latest
+    outputs:
+      analysis-id: ${{ steps.analyze.outputs.analysis-id }}
+      selected-tests: ${{ steps.analyze.outputs.selected-tests }}
+      time-saved: ${{ steps.analyze.outputs.time-saved }}
+      risk-score: ${{ steps.analyze.outputs.risk-score }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Get changed files
+        id: changed-files
+        run: |
+          # Get list of changed files
+          git diff --name-status origin/${{ github.base_ref }}...HEAD > changed_files.txt
+          
+          # Parse and format for API
+          python -c "
+          import json
+          import re
+          
+          changed_files = []
+          with open('changed_files.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line:
+                      parts = line.split('\t')
+                      if len(parts) >= 2:
+                          status = parts[0]
+                          file_path = parts[1]
+                          
+                          # Map git status to change type
+                          if status == 'A':
+                              change_type = 'added'
+                          elif status == 'M':
+                              change_type = 'modified'
+                          elif status == 'D':
+                              change_type = 'deleted'
+                          else:
+                              change_type = 'modified'
+                          
+                          changed_files.append({
+                              'file_path': file_path,
+                              'change_type': change_type,
+                              'lines_changed': None
+                          })
+          
+          # Write to file for next steps
+          with open('changed_files.json', 'w') as f:
+              json.dump(changed_files, f, indent=2)
+          
+          print(f'Found {len(changed_files)} changed files')
+          "
+      
+      - name: Call Impact Analyzer API
+        id: analyze
+        run: |
+          # Read changed files
+          changed_files=$(cat changed_files.json)
+          
+          # Prepare request payload
+          payload=$(cat <<EOF
+          {
+            "repository": "${{ github.repository }}",
+            "pull_request_id": "${{ github.event.number }}",
+            "changed_files": $changed_files,
+            "base_branch": "${{ github.base_ref }}",
+            "head_branch": "${{ github.head_ref }}",
+            "commit_sha": "${{ github.sha }}"
+          }
+          EOF
+          )
+          
+          echo "Request payload:"
+          echo "$payload"
+          
+          # Call the impact analyzer API
+          response=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ env.API_KEY }}" \
+            -d "$payload" \
+            "${{ env.API_ENDPOINT }}/api/v1/analyze")
+          
+          echo "API Response:"
+          echo "$response"
+          
+          # Extract values from response
+          analysis_id=$(echo "$response" | jq -r '.analysis_id // empty')
+          selected_tests=$(echo "$response" | jq -r '.selected_tests | length // 0')
+          time_saved=$(echo "$response" | jq -r '.estimated_time_saved // 0')
+          risk_score=$(echo "$response" | jq -r '.risk_score // 0')
+          
+          # Set outputs
+          echo "analysis-id=$analysis_id" >> $GITHUB_OUTPUT
+          echo "selected-tests=$selected_tests" >> $GITHUB_OUTPUT
+          echo "time-saved=$time_saved" >> $GITHUB_OUTPUT
+          echo "risk-score=$risk_score" >> $GITHUB_OUTPUT
+          
+          # Save selected tests for next job
+          echo "$response" | jq -r '.selected_tests[] | "\(.test_file_path):\(.test_function_name)"' > selected_tests.txt
+          
+          echo "Analysis completed:"
+          echo "- Analysis ID: $analysis_id"
+          echo "- Selected tests: $selected_tests"
+          echo "- Time saved: $time_saved minutes"
+          echo "- Risk score: $risk_score"
+      
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read analysis results
+            const analysisId = '${{ steps.analyze.outputs.analysis-id }}';
+            const selectedTests = parseInt('${{ steps.analyze.outputs.selected-tests }}');
+            const timeSaved = parseFloat('${{ steps.analyze.outputs.time-saved }}');
+            const riskScore = parseFloat('${{ steps.analyze.outputs.risk-score }}');
+            
+            // Read selected tests file
+            let selectedTestsList = [];
+            try {
+              const testsContent = fs.readFileSync('selected_tests.txt', 'utf8');
+              selectedTestsList = testsContent.split('\n').filter(line => line.trim());
+            } catch (error) {
+              console.log('Could not read selected tests file');
+            }
+            
+            // Create comment
+            let comment = `## 🤖 AI Impact Analysis Results\n\n`;
+            comment += `**Analysis ID:** \`${analysisId}\`\n\n`;
+            comment += `### 📊 Summary\n`;
+            comment += `- **Tests Selected:** ${selectedTests}\n`;
+            comment += `- **Estimated Time Saved:** ${timeSaved.toFixed(1)} minutes\n`;
+            comment += `- **Risk Score:** ${(riskScore * 100).toFixed(1)}%\n\n`;
+            
+            // Risk assessment
+            if (riskScore > 0.7) {
+              comment += `⚠️ **High Risk Detected** - Consider running more tests\n\n`;
+            } else if (riskScore < 0.3) {
+              comment += `✅ **Low Risk** - Selected tests should provide good coverage\n\n`;
+            } else {
+              comment += `⚠️ **Medium Risk** - Monitor test results closely\n\n`;
+            }
+            
+            if (selectedTestsList.length > 0) {
+              comment += `### 🧪 Selected Tests\n`;
+              comment += `The following tests will be executed:\n\n`;
+              comment += '```\n';
+              selectedTestsList.forEach(test => {
+                comment += `${test}\n`;
+              });
+              comment += '```\n\n';
+            }
+            
+            comment += `### 📈 Impact\n`;
+            comment += `By running only the selected tests, this analysis estimates saving **${timeSaved.toFixed(1)} minutes** compared to running the full test suite.\n\n`;
+            comment += `---\n`;
+            comment += `*This analysis was performed by the AI Driven Impact Analyzer*`;
+            
+            // Post comment
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: impact-analysis-results
+          path: |
+            changed_files.json
+            selected_tests.txt
+            analysis_response.json
+
+  run-selected-tests:
+    name: Run Selected Tests
+    runs-on: ubuntu-latest
+    needs: impact-analysis
+    if: needs.impact-analysis.outputs.selected-tests != '0'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Download analysis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: impact-analysis-results
+      
+      - name: Install dependencies
+        run: |
+          # Install project dependencies
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          elif [ -f "pyproject.toml" ]; then
+            pip install -e .
+          elif [ -f "setup.py" ]; then
+            pip install -e .
+          fi
+      
+      - name: Run selected tests
+        id: run-tests
+        run: |
+          # Read selected tests
+          if [ -f "selected_tests.txt" ]; then
+            echo "Running selected tests..."
+            
+            # Parse test files and functions
+            test_files=()
+            test_functions=()
+            
+            while IFS=':' read -r file_path function_name; do
+              if [ -n "$file_path" ] && [ -n "$function_name" ]; then
+                test_files+=("$file_path")
+                test_functions+=("$function_name")
+              fi
+            done < selected_tests.txt
+            
+            # Run tests using pytest
+            if [ ${#test_files[@]} -gt 0 ]; then
+              echo "Test files to run: ${test_files[*]}"
+              echo "Test functions to run: ${test_functions[*]}"
+              
+              # Run tests with pytest
+              pytest "${test_files[@]}" -v --tb=short
+              test_exit_code=$?
+              
+              echo "exit-code=$test_exit_code" >> $GITHUB_OUTPUT
+            else
+              echo "No valid tests found to run"
+              echo "exit-code=0" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No selected tests file found"
+            echo "exit-code=0" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Report test results
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const testExitCode = parseInt('${{ steps.run-tests.outputs.exit-code }}');
+            const analysisId = '${{ needs.impact-analysis.outputs.analysis-id }}';
+            const selectedTests = parseInt('${{ needs.impact-analysis.outputs.selected-tests }}');
+            const timeSaved = parseFloat('${{ needs.impact-analysis.outputs.time-saved }}');
+            
+            let status, emoji;
+            if (testExitCode === 0) {
+              status = 'PASSED';
+              emoji = '✅';
+            } else {
+              status = 'FAILED';
+              emoji = '❌';
+            }
+            
+            const comment = `## 🧪 Test Execution Results\n\n` +
+              `${emoji} **Status:** ${status}\n\n` +
+              `**Analysis ID:** \`${analysisId}\`\n` +
+              `**Tests Executed:** ${selectedTests}\n` +
+              `**Time Saved:** ${timeSaved.toFixed(1)} minutes\n\n` +
+              `---\n` +
+              `*Tests were selected by the AI Driven Impact Analyzer*`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-execution-results
+          path: |
+            .pytest_cache/
+            test-results/
+            coverage-reports/
+
+  notify-completion:
+    name: Notify Analysis Completion
+    runs-on: ubuntu-latest
+    needs: [impact-analysis, run-selected-tests]
+    if: always()
+    
+    steps:
+      - name: Notify completion
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const analysisId = '${{ needs.impact-analysis.outputs.analysis-id }}';
+            const selectedTests = parseInt('${{ needs.impact-analysis.outputs.selected-tests }}');
+            const timeSaved = parseFloat('${{ needs.impact-analysis.outputs.time-saved }}');
+            const riskScore = parseFloat('${{ needs.impact-analysis.outputs.risk-score }}');
+            
+            let testStatus = 'Not executed';
+            if ('${{ needs.run-selected-tests.result }}' === 'success') {
+              testStatus = '✅ PASSED';
+            } else if ('${{ needs.run-selected-tests.result }}' === 'failure') {
+              testStatus = '❌ FAILED';
+            }
+            
+            const comment = `## 🎯 Impact Analysis Complete\n\n` +
+              `**Analysis ID:** \`${analysisId}\`\n` +
+              `**Tests Selected:** ${selectedTests}\n` +
+              `**Test Execution:** ${testStatus}\n` +
+              `**Time Saved:** ${timeSaved.toFixed(1)} minutes\n` +
+              `**Risk Score:** ${(riskScore * 100).toFixed(1)}%\n\n` +
+              `---\n` +
+              `*Analysis completed by AI Driven Impact Analyzer*`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            }); 
